@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityService.ScreenshotResult
 import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -33,8 +34,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlin.random.Random
 
 class ClickService : AccessibilityService() {
-    // ---- Settings you can edit (all lowercase) ----
-    private val targets = listOf("check in", "check-in", "claim", "collect", "spin", "get coins")
+    // ---- Fixed settings (words to tap come from the active profile) ----
     private val never = listOf("buy", "pay", "order", "checkout", "place")
     private val needsOrange = listOf("claim")
     private val closeLabels = setOf("x", "×", "✕", "✖", "close", "dismiss", "close ad", "close popup")
@@ -45,8 +45,11 @@ class ClickService : AccessibilityService() {
     private val loop = Runnable { tick() }
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val lastTap = HashMap<String, Long>()
-    private val onlyZones = mutableListOf<Rect>()   // if any exist, clicks happen ONLY inside these
-    private val avoidZones = mutableListOf<Rect>()  // never click inside these
+    private lateinit var profile: Profile
+    private var targets = listOf<String>()
+    private var onlyZones = mutableListOf<Rect>()    // if any: clicks happen ONLY inside
+    private var avoidZones = mutableListOf<Rect>()   // never click inside
+    private var scrollZones = mutableListOf<Rect>()  // if any: scrolling happens ONLY inside
     private var running = false
     private var taps = 0
     private var scrolls = 0
@@ -55,6 +58,7 @@ class ClickService : AccessibilityService() {
     private var lastScroll = 0L
     private var panel: LinearLayout? = null
     private var status: TextView? = null
+    private var profBtn: Button? = null
     private lateinit var wm: WindowManager
 
     private fun overlayParams(w: Int, h: Int, extra: Int) = WindowManager.LayoutParams(
@@ -66,38 +70,42 @@ class ClickService : AccessibilityService() {
     ).apply { gravity = Gravity.TOP or Gravity.START }
 
     private fun updateStatus() {
-        status?.text = "Taps: $taps  Scrolls: $scrolls\nOnly: ${onlyZones.size}  Avoid: ${avoidZones.size}"
+        status?.text = "Taps: $taps  Scrolls: $scrolls\nOnly:${onlyZones.size} Avoid:${avoidZones.size} Scroll:${scrollZones.size}"
     }
 
-    // ---- Zones ----
-    private fun saveZones() {
-        fun s(l: List<Rect>) = l.joinToString(";") { "${it.left},${it.top},${it.right},${it.bottom}" }
-        getSharedPreferences("zones", MODE_PRIVATE).edit()
-            .putString("only", s(onlyZones)).putString("avoid", s(avoidZones)).apply()
+    // ---- Profiles & zones ----
+    private fun reload() {
+        profile = Store.current(this)
+        targets = profile.targets.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        onlyZones = Store.zones(profile.only); avoidZones = Store.zones(profile.avoid)
+        scrollZones = Store.zones(profile.scroll)
+        profBtn?.text = "Profile: ${profile.name}"
+        updateStatus()
     }
 
-    private fun loadZones() {
-        val sp = getSharedPreferences("zones", MODE_PRIVATE)
-        fun p(key: String, out: MutableList<Rect>) {
-            out.clear()
-            sp.getString(key, "")!!.split(";").filter { it.isNotBlank() }.forEach {
-                val v = it.split(",").map { n -> n.toInt() }
-                out.add(Rect(v[0], v[1], v[2], v[3]))
-            }
-        }
-        p("only", onlyZones); p("avoid", avoidZones)
+    private fun persistZones() {
+        val l = Store.load(this)
+        val p = l.find { it.name == profile.name } ?: return
+        p.only = Store.str(onlyZones); p.avoid = Store.str(avoidZones); p.scroll = Store.str(scrollZones)
+        Store.save(this, l)
     }
 
     private fun inAny(l: List<Rect>, x: Int, y: Int) = l.any { it.contains(x, y) }
     private fun allowed(x: Int, y: Int, useOnly: Boolean = true) =
         !inAny(avoidZones, x, y) && (!useOnly || onlyZones.isEmpty() || inAny(onlyZones, x, y))
 
-    // Full-screen layer for drawing a zone with your finger.
-    private inner class ZoneView(val isOnly: Boolean) : View(this@ClickService) {
+    private fun panelRect(): Rect {
+        val p = panel ?: return Rect()
+        val loc = IntArray(2); p.getLocationOnScreen(loc)
+        return Rect(loc[0], loc[1], loc[0] + p.width, loc[1] + p.height)
+    }
+
+    // Full-screen layer for drawing a zone. mode: 0 = click-only, 1 = avoid, 2 = scroll.
+    private inner class ZoneView(val mode: Int) : View(this@ClickService) {
         private var sx = 0f; private var sy = 0f; private var ex = 0f; private var ey = 0f
         private var drag = false
         private val p = Paint()
-        private val green = 0xFF4CAF50.toInt(); private val red = 0xFFF44336.toInt()
+        private val colors = intArrayOf(0xFF4CAF50.toInt(), 0xFFF44336.toInt(), 0xFF2196F3.toInt())
 
         private fun box(c: Canvas, r: Rect, color: Int) {
             p.style = Paint.Style.FILL; p.color = (color and 0x00FFFFFF) or 0x55000000; c.drawRect(r, p)
@@ -106,12 +114,12 @@ class ClickService : AccessibilityService() {
 
         override fun onDraw(c: Canvas) {
             c.drawColor(0x66000000)
-            onlyZones.forEach { box(c, it, green) }
-            avoidZones.forEach { box(c, it, red) }
-            if (drag) box(c, Rect(minOf(sx, ex).toInt(), minOf(sy, ey).toInt(), maxOf(sx, ex).toInt(), maxOf(sy, ey).toInt()),
-                if (isOnly) green else red)
+            onlyZones.forEach { box(c, it, colors[0]) }
+            avoidZones.forEach { box(c, it, colors[1]) }
+            scrollZones.forEach { box(c, it, colors[2]) }
+            if (drag) box(c, Rect(minOf(sx, ex).toInt(), minOf(sy, ey).toInt(), maxOf(sx, ex).toInt(), maxOf(sy, ey).toInt()), colors[mode])
             p.style = Paint.Style.FILL; p.color = Color.WHITE; p.textSize = 46f
-            c.drawText(if (isOnly) "Drag to draw a CLICK-ONLY area (tap to cancel)" else "Drag to draw an AVOID area (tap to cancel)", 40f, 180f, p)
+            c.drawText("Drag to draw a ${arrayOf("CLICK-ONLY", "AVOID", "SCROLL")[mode]} area (tap to cancel)", 40f, 180f, p)
         }
 
         override fun onTouchEvent(e: MotionEvent): Boolean {
@@ -121,7 +129,10 @@ class ClickService : AccessibilityService() {
                 MotionEvent.ACTION_UP -> {
                     drag = false
                     val r = Rect(minOf(sx, ex).toInt(), minOf(sy, ey).toInt(), maxOf(sx, ex).toInt(), maxOf(sy, ey).toInt())
-                    if (r.width() > 40 && r.height() > 40) { (if (isOnly) onlyZones else avoidZones).add(r); saveZones() }
+                    if (r.width() > 40 && r.height() > 40) {
+                        when (mode) { 0 -> onlyZones; 1 -> avoidZones; else -> scrollZones }.add(r)
+                        persistZones()
+                    }
                     try { wm.removeView(this) } catch (_: Exception) {}
                     updateStatus()
                     return true
@@ -131,42 +142,97 @@ class ClickService : AccessibilityService() {
         }
     }
 
-    private fun drawZone(isOnly: Boolean) {
+    private fun drawZone(mode: Int) {
         running = false; handler.removeCallbacks(loop)   // pause so the dim layer isn't scanned
         status?.text = "Draw the area, then press START"
-        wm.addView(ZoneView(isOnly), overlayParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, 0))
+        wm.addView(ZoneView(mode), overlayParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, 0))
+    }
+
+    // Blue line + arrow showing where a scroll swipe happens.
+    private inner class LineView(val x1: Float, val y1: Float, val x2: Float, val y2: Float) : View(this@ClickService) {
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        override fun onDraw(c: Canvas) {
+            p.color = 0xFF2196F3.toInt(); p.strokeWidth = 14f; p.strokeCap = Paint.Cap.ROUND
+            c.drawLine(x1, y1, x2, y2, p)
+            p.style = Paint.Style.FILL
+            c.drawCircle(x1, y1, 24f, p)
+            c.drawPath(Path().apply { moveTo(x2, y2 - 20); lineTo(x2 - 36, y2 + 36); lineTo(x2 + 36, y2 + 36); close() }, p)
+        }
+    }
+
+    private fun showScroll(x1: Float, y1: Float, x2: Float, y2: Float, ms: Long) {
+        val v = LineView(x1, y1, x2, y2)
+        wm.addView(v, overlayParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE))
+        v.postDelayed({ try { wm.removeView(v) } catch (_: Exception) {} }, ms + 300)
     }
 
     override fun onServiceConnected() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        loadZones()
 
         val handle = TextView(this).apply {
-            text = "≡ drag to move"; setTextColor(Color.WHITE); setPadding(8, 8, 8, 12)
+            text = "≡ move"; setTextColor(Color.WHITE); setPadding(16, 16, 24, 16)
         }
         val st = TextView(this).apply { setTextColor(Color.WHITE); setPadding(8, 0, 8, 8) }
-        status = st; updateStatus()
+        status = st
 
-        fun btn(label: String, act: () -> Unit) = Button(this).apply { text = label; setOnClickListener { act() } }
-        val row1 = LinearLayout(this).apply {
-            addView(btn("START") { running = true; same = 0; lastSig = ""; handler.removeCallbacks(loop); updateStatus(); tick() })
-            addView(btn("STOP") { running = false; handler.removeCallbacks(loop); st.text = "Stopped" })
-        }
-        val row2 = LinearLayout(this).apply {
-            addView(btn("ONLY") { drawZone(true) })
-            addView(btn("AVOID") { drawZone(false) })
-            addView(btn("CLEAR") { onlyZones.clear(); avoidZones.clear(); saveZones(); updateStatus() })
+        fun btn(label: String, act: () -> Unit) = Button(this).apply {
+            text = label; textSize = 12f; minWidth = 0; minimumWidth = 0; setPadding(20, 0, 20, 0)
+            setOnClickListener { act() }
         }
 
-        val box = LinearLayout(this).apply {
+        profBtn = btn("") {
+            val l = Store.load(this)
+            val i = l.indexOfFirst { it.name == profile.name }
+            Store.setActive(this, l[(i + 1) % l.size].name)
+            reload()
+        }
+        val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(16, 16, 16, 16)
-            background = GradientDrawable().apply { setColor(0xCC222222.toInt()); cornerRadius = 28f }
-            addView(handle); addView(st); addView(row1); addView(row2)
+            addView(st)
+            addView(LinearLayout(context).apply {
+                addView(btn("START") {
+                    reload(); running = true; same = 0; lastSig = ""
+                    handler.removeCallbacks(loop); tick()
+                })
+                addView(profBtn)
+            })
+            addView(LinearLayout(context).apply {
+                addView(btn("ONLY") { drawZone(0) })
+                addView(btn("AVOID") { drawZone(1) })
+                addView(btn("SCROLL") { drawZone(2) })
+                addView(btn("CLEAR") {
+                    onlyZones.clear(); avoidZones.clear(); scrollZones.clear(); persistZones(); updateStatus()
+                })
+            })
+            addView(btn("PROFILES") {
+                try { startActivity(Intent(this@ClickService, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                catch (_: Exception) { st.text = "Open the Coin Clicker app from your launcher" }
+            })
         }
 
         val lp = overlayParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, 0)
             .apply { x = 40; y = 300 }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 8, 16, 16)
+            background = GradientDrawable().apply { setColor(0xCC222222.toInt()); cornerRadius = 28f }
+        }
+        val minBtn = btn("–") {}
+        minBtn.setOnClickListener {
+            val hide = content.visibility == View.VISIBLE
+            content.visibility = if (hide) View.GONE else View.VISIBLE
+            minBtn.text = if (hide) "+" else "–"
+            box.post { wm.updateViewLayout(box, lp) }
+        }
+        // Header (always visible): drag handle, STOP, minimize.
+        box.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(handle)
+            addView(btn("STOP") { running = false; handler.removeCallbacks(loop); st.text = "Stopped" })
+            addView(minBtn)
+        })
+        box.addView(content)
 
         handle.setOnTouchListener(object : View.OnTouchListener {
             var ix = 0; var iy = 0; var tx = 0f; var ty = 0f
@@ -185,9 +251,10 @@ class ClickService : AccessibilityService() {
 
         wm.addView(box, lp)
         panel = box
+        reload()
     }
 
-    // Ring shown ~0.7s: red = tap, amber = popup closed, blue = scroll.
+    // Ring shown ~0.7s: red = tap, amber = popup closed.
     private fun flash(cx: Int, cy: Int, color: Int = Color.RED) {
         val size = 140
         val ring = View(this).apply {
@@ -233,10 +300,11 @@ class ClickService : AccessibilityService() {
     }
 
     // Closes a popup ONLY by pressing a button labelled exactly "x" / "×" / "close" etc.
-    // Tries the app's accessibility tree first, then reads the screenshot text.
     private fun closePopup(t: Text): Boolean {
-        val r = findCloseNode() ?: t.textBlocks.flatMap { it.lines }
-            .firstOrNull { it.text.trim().lowercase() in closeLabels }?.boundingBox ?: return false
+        val pr = panelRect()
+        val r = findCloseNode() ?: t.textBlocks.flatMap { it.lines }.firstOrNull {
+            it.text.trim().lowercase() in closeLabels && it.boundingBox?.let { b -> !Rect.intersects(b, pr) } == true
+        }?.boundingBox ?: return false
         val x = r.centerX(); val y = r.centerY()
         if (!allowed(x, y, useOnly = false)) return false   // avoid-zones still apply
         if (!cooldown("x${x / 80},${y / 80}")) return false
@@ -265,9 +333,11 @@ class ClickService : AccessibilityService() {
 
     // Returns true if it tapped something.
     private fun handle(t: Text, bmp: Bitmap): Boolean {
+        val pr = panelRect()
         for (block in t.textBlocks) for (line in block.lines) {
             val s = line.text.lowercase()
             val box = line.boundingBox ?: continue
+            if (Rect.intersects(box, pr)) continue   // never tap our own panel
             if (never.any { s.contains(it) } || targets.none { s.contains(it) }) continue
             if (needsOrange.any { s.contains(it) } && !isOrange(bmp, box)) continue
             if (!allowed(box.centerX(), box.centerY())) continue
@@ -304,8 +374,9 @@ class ClickService : AccessibilityService() {
     // If a timer (like 00:15) is on screen but hasn't changed for a few scans, scroll down.
     private fun watchTimer(t: Text) {
         val minY = resources.displayMetrics.heightPixels * 0.07 // ignore the status-bar clock
+        val pr = panelRect()
         val sig = t.textBlocks.flatMap { it.lines }
-            .filter { (it.boundingBox?.centerY() ?: 0) > minY }
+            .filter { l -> l.boundingBox?.let { it.centerY() > minY && !Rect.intersects(it, pr) } == true }
             .flatMap { l -> timerRe.findAll(l.text).map { it.value }.toList() }
             .joinToString("|")
         if (sig.isEmpty() || sig != lastSig) { same = 0; lastSig = sig; return }
@@ -317,21 +388,24 @@ class ClickService : AccessibilityService() {
         }
     }
 
-    // Swipe is placed randomly around the screen center, with random length and speed.
+    // Swipe goes inside a SCROLL area if you drew one, otherwise around the screen center.
     private fun scrollDown() {
-        val w = resources.displayMetrics.widthPixels.toFloat()
-        val h = resources.displayMetrics.heightPixels.toFloat()
-        val cx = w / 2 + (Random.nextFloat() - 0.5f) * 0.24f * w
-        val cy = h / 2 + (Random.nextFloat() - 0.5f) * 0.10f * h
-        val d = h * (0.28f + Random.nextFloat() * 0.14f)
-        val p = Path().apply {
-            moveTo(cx + (Random.nextFloat() - 0.5f) * 0.04f * w, cy + d / 2)
-            lineTo(cx + (Random.nextFloat() - 0.5f) * 0.04f * w, cy - d / 2)
-        }
-        dispatchGesture(GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(p, 0, Random.nextLong(300, 700))).build(), null, null)
+        val w = resources.displayMetrics.widthPixels
+        val h = resources.displayMetrics.heightPixels
+        val zone = scrollZones.randomOrNull()
+        val a = zone ?: Rect(0, 0, w, h)
+        val lo = if (zone != null) 0.5f else 0.28f
+        val hi = if (zone != null) 0.85f else 0.42f
+        val cx = a.exactCenterX() + (Random.nextFloat() - 0.5f) * 0.24f * a.width()
+        val cy = a.exactCenterY() + (Random.nextFloat() - 0.5f) * 0.10f * a.height()
+        val d = a.height() * (lo + Random.nextFloat() * (hi - lo))
+        val x1 = cx + (Random.nextFloat() - 0.5f) * 0.04f * a.width(); val y1 = cy + d / 2
+        val x2 = cx + (Random.nextFloat() - 0.5f) * 0.04f * a.width(); val y2 = cy - d / 2
+        val dur = Random.nextLong(300, 700)
+        dispatchGesture(GestureDescription.Builder().addStroke(
+            GestureDescription.StrokeDescription(Path().apply { moveTo(x1, y1); lineTo(x2, y2) }, 0, dur)).build(), null, null)
         scrolls++; updateStatus()
-        flash(cx.toInt(), (cy + d / 2).toInt(), 0xFF2196F3.toInt())
+        showScroll(x1, y1, x2, y2, dur)
     }
 
     private fun tap(x: Float, y: Float) {
