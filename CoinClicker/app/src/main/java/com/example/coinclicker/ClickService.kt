@@ -38,8 +38,7 @@ class ClickService : AccessibilityService() {
     private val never = listOf("buy", "pay", "order", "checkout", "place")
     private val needsOrange = listOf("claim")
     private val closeLabels = setOf("x", "×", "✕", "✖", "close", "dismiss", "close ad", "close popup")
-    private val frozenScans = 3
-    private val timerRe = Regex("\\b\\d{1,2}:\\d{2}(:\\d{2})?\\b")
+    private val intervals = intArrayOf(0, 3, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120) // seconds, 0 = off
 
     private val handler = Handler(Looper.getMainLooper())
     private val loop = Runnable { tick() }
@@ -53,12 +52,11 @@ class ClickService : AccessibilityService() {
     private var running = false
     private var taps = 0
     private var scrolls = 0
-    private var lastSig = ""
-    private var same = 0
     private var lastScroll = 0L
     private var panel: LinearLayout? = null
     private var status: TextView? = null
     private var profBtn: Button? = null
+    private var intervalTv: TextView? = null
     private lateinit var wm: WindowManager
 
     private fun overlayParams(w: Int, h: Int, extra: Int) = WindowManager.LayoutParams(
@@ -80,13 +78,14 @@ class ClickService : AccessibilityService() {
         onlyZones = Store.zones(profile.only); avoidZones = Store.zones(profile.avoid)
         scrollZones = Store.zones(profile.scroll)
         profBtn?.text = "Profile: ${profile.name}"
+        showInterval()
         updateStatus()
     }
 
-    private fun persistZones() {
+    private fun persist() {
         val l = Store.load(this)
         val p = l.find { it.name == profile.name } ?: return
-        p.only = Store.str(onlyZones); p.avoid = Store.str(avoidZones); p.scroll = Store.str(scrollZones)
+        p.only = Store.str(onlyZones); p.avoid = Store.str(avoidZones); p.scroll = Store.str(scrollZones); p.scrollSec = profile.scrollSec
         Store.save(this, l)
     }
 
@@ -131,7 +130,7 @@ class ClickService : AccessibilityService() {
                     val r = Rect(minOf(sx, ex).toInt(), minOf(sy, ey).toInt(), maxOf(sx, ex).toInt(), maxOf(sy, ey).toInt())
                     if (r.width() > 40 && r.height() > 40) {
                         when (mode) { 0 -> onlyZones; 1 -> avoidZones; else -> scrollZones }.add(r)
-                        persistZones()
+                        persist()
                     }
                     try { wm.removeView(this) } catch (_: Exception) {}
                     updateStatus()
@@ -192,17 +191,23 @@ class ClickService : AccessibilityService() {
             addView(st)
             addView(LinearLayout(context).apply {
                 addView(btn("START") {
-                    reload(); running = true; same = 0; lastSig = ""
+                    reload(); running = true; lastScroll = SystemClock.uptimeMillis()
                     handler.removeCallbacks(loop); tick()
                 })
                 addView(profBtn)
+            })
+            addView(LinearLayout(context).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(btn("–") { stepInterval(-1) })
+                addView(TextView(context).apply { setTextColor(Color.WHITE); setPadding(16, 0, 16, 0); intervalTv = this })
+                addView(btn("+") { stepInterval(1) })
             })
             addView(LinearLayout(context).apply {
                 addView(btn("ONLY") { drawZone(0) })
                 addView(btn("AVOID") { drawZone(1) })
                 addView(btn("SCROLL") { drawZone(2) })
                 addView(btn("CLEAR") {
-                    onlyZones.clear(); avoidZones.clear(); scrollZones.clear(); persistZones(); updateStatus()
+                    onlyZones.clear(); avoidZones.clear(); scrollZones.clear(); persist(); updateStatus()
                 })
             })
             addView(btn("PROFILES") {
@@ -225,11 +230,23 @@ class ClickService : AccessibilityService() {
             minBtn.text = if (hide) "+" else "–"
             box.post { wm.updateViewLayout(box, lp) }
         }
-        // Header (always visible): drag handle, STOP, minimize.
+        // EXIT: tap twice. Turns the service off and removes the panel.
+        var armed = false
+        val exitBtn = btn("EXIT") {}
+        exitBtn.setOnClickListener {
+            if (armed) {
+                running = false; handler.removeCallbacks(loop); disableSelf()
+            } else {
+                armed = true; exitBtn.text = "SURE?"
+                exitBtn.postDelayed({ armed = false; exitBtn.text = "EXIT" }, 3000)
+            }
+        }
+        // Header (always visible): drag handle, STOP, EXIT, minimize.
         box.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(handle)
             addView(btn("STOP") { running = false; handler.removeCallbacks(loop); st.text = "Stopped" })
+            addView(exitBtn)
             addView(minBtn)
         })
         box.addView(content)
@@ -279,7 +296,7 @@ class ClickService : AccessibilityService() {
                 if (bmp == null) return next()
                 recognizer.process(InputImage.fromBitmap(bmp, 0))
                     .addOnSuccessListener {
-                        if (closePopup(it) || handle(it, bmp)) { same = 0 } else watchTimer(it)
+                        if (!(closePopup(it) || handle(it, bmp))) maybeScroll()
                         next()
                     }
                     .addOnFailureListener { next() }
@@ -371,21 +388,23 @@ class ClickService : AccessibilityService() {
         return hits >= 5
     }
 
-    // If a timer (like 00:15) is on screen but hasn't changed for a few scans, scroll down.
-    private fun watchTimer(t: Text) {
-        val minY = resources.displayMetrics.heightPixels * 0.07 // ignore the status-bar clock
-        val pr = panelRect()
-        val sig = t.textBlocks.flatMap { it.lines }
-            .filter { l -> l.boundingBox?.let { it.centerY() > minY && !Rect.intersects(it, pr) } == true }
-            .flatMap { l -> timerRe.findAll(l.text).map { it.value }.toList() }
-            .joinToString("|")
-        if (sig.isEmpty() || sig != lastSig) { same = 0; lastSig = sig; return }
-        same++
+    private fun showInterval() {
+        val sec = profile.scrollSec
+        intervalTv?.text = if (sec <= 0) "Scroll: off" else "Scroll every ${sec}s"
+    }
+
+    private fun stepInterval(dir: Int) {
+        var i = intervals.indexOfFirst { it >= profile.scrollSec }
+        if (i < 0) i = intervals.lastIndex
+        profile.scrollSec = intervals[(i + dir).coerceIn(0, intervals.lastIndex)]
+        persist(); showInterval()
+    }
+
+    // Scrolls once every N seconds (checked on each ~1.5s scan, and only when nothing was just tapped).
+    private fun maybeScroll() {
+        val sec = profile.scrollSec
         val now = SystemClock.uptimeMillis()
-        if (same >= frozenScans && now - lastScroll > 6000) {
-            lastScroll = now; same = 0
-            scrollDown()
-        }
+        if (sec > 0 && now - lastScroll >= sec * 1000L) { lastScroll = now; scrollDown() }
     }
 
     // Swipe goes inside a SCROLL area if you drew one, otherwise around the screen center.
