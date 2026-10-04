@@ -7,7 +7,7 @@ import org.json.JSONObject
 
 data class Profile(
     var name: String, var targets: String,
-    var only: String = "", var avoid: String = "", var scroll: String = ""
+    var only: String = "", var avoid: String = "", var scroll: String = "", var scrollSec: Int = 10
 )
 
 object Store {
@@ -20,7 +20,7 @@ object Store {
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             out.add(Profile(o.getString("name"), o.getString("targets"),
-                o.optString("only"), o.optString("avoid"), o.optString("scroll")))
+                o.optString("only"), o.optString("avoid"), o.optString("scroll"), o.optInt("scrollSec", 10)))
         }
         if (out.isEmpty()) out.add(Profile("Default", DEFAULT_TARGETS))
         return out
@@ -30,7 +30,7 @@ object Store {
         val arr = JSONArray()
         l.forEach {
             arr.put(JSONObject().put("name", it.name).put("targets", it.targets)
-                .put("only", it.only).put("avoid", it.avoid).put("scroll", it.scroll))
+                .put("only", it.only).put("avoid", it.avoid).put("scroll", it.scroll).put("scrollSec", it.scrollSec))
         }
         sp(c).edit().putString("list", arr.toString()).apply()
     }
